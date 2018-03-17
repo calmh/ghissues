@@ -1,14 +1,15 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
-	"path"
 	"path/filepath"
-	"regexp"
+	"text/template"
+
+	"github.com/google/go-github/github"
+	"golang.org/x/oauth2"
 )
 
 const (
@@ -17,27 +18,16 @@ const (
 	ExitUsage
 )
 
-type issue struct {
-	Number int
-	Title  string
-	User   struct {
-		Login string
-	}
-	Labels []struct {
-		Name string
-	}
-	State string
-	Body  string
-}
+var tpl = template.Must(template.New("issue.md").ParseFiles("issue.md"))
 
 func main() {
 	flag.Parse()
 
-	if flag.NArg() != 2 {
+	if flag.NArg() != 3 {
 		fmt.Println("ghissues - Create offline copy of GitHub issues list.")
 		fmt.Println()
 		fmt.Println("Usage:")
-		fmt.Printf("	%s <repo> <output directory>\n", os.Args[0])
+		fmt.Printf("	%s <owner> <repo> <output directory>\n", os.Args[0])
 		fmt.Println()
 		fmt.Println("Example:")
 		fmt.Printf("	%s syncthing/syncthing /tmp/syncthing-issues\n", os.Args[0])
@@ -46,94 +36,72 @@ func main() {
 		os.Exit(ExitUsage)
 	}
 
-	repo := flag.Arg(0)
-	outDir := flag.Arg(1)
+	owner := flag.Arg(0)
+	repo := flag.Arg(1)
+	outDir := flag.Arg(2)
 	if err := os.MkdirAll(outDir, 0777); err != nil {
 		fmt.Println("Output dir:", err)
 		os.Exit(ExitError)
 	}
 
-	issues, err := loadIssues(repo)
+	ts := oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: os.Getenv("GITHUB_TOKEN")},
+	)
+	tc := oauth2.NewClient(oauth2.NoContext, ts)
+	client := github.NewClient(tc)
+
+	issues, err := loadIssues(client, owner, repo)
 	if err != nil {
 		fmt.Println("Loading issues:", err)
 		os.Exit(ExitError)
 	}
 
-	if err := writeIndex(issues, outDir); err != nil {
-		fmt.Println("Write index:", err)
-		os.Exit(ExitError)
-	}
-
 	for _, issue := range issues {
-		if err := writeIssue(issue, outDir); err != nil {
-			fmt.Println("Write issue:", err)
-			os.Exit(ExitError)
+		issue, _, err := client.Issues.Get(context.TODO(), owner, repo, issue.GetNumber())
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		out, err := os.Create(filepath.Join(outDir, fmt.Sprintf("%d.md", issue.GetNumber())))
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		err = tpl.Execute(out, map[string]interface{}{
+			"issue": issue,
+		})
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		err = out.Close()
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
 		}
 	}
 }
 
-func loadIssues(repo string) ([]issue, error) {
-	// TODO: Load issue comments. Requires a request per issue, will be
-	// subject to rate limits...
-
-	var issues []issue
-
-	link := "https://" + path.Join("api.github.com/repos", repo, "issues")
-	for link != "" {
-		fmt.Println("Loading", link, "...")
-
-		resp, err := http.Get(link)
+func loadIssues(client *github.Client, owner, repo string) ([]*github.Issue, error) {
+	var issues []*github.Issue
+	opts := &github.IssueListByRepoOptions{
+		State:       "all",
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	for {
+		is, resp, err := client.Issues.ListByRepo(context.TODO(), owner, repo, opts)
 		if err != nil {
-			return nil, err
+			return issues, err
 		}
-
-		var is []issue
-		err = json.NewDecoder(resp.Body).Decode(&is)
-		resp.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-
 		issues = append(issues, is...)
-
-		link = parseRel(resp.Header.Get("Link"), "next")
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
 	}
 
 	return issues, nil
-}
-
-func parseRel(link, rel string) string {
-	exp := regexp.MustCompile(`<([^>]+)>;\s+rel="` + rel + `"`)
-	match := exp.FindStringSubmatch(link)
-	if len(match) == 2 {
-		return match[1]
-	}
-	return ""
-}
-
-func writeIndex(issues []issue, outDir string) error {
-	fd, err := os.Create(filepath.Join(outDir, "index.html"))
-	if err != nil {
-		return err
-	}
-
-	err = indexTpl.Execute(fd, map[string]interface{}{
-		"issues": issues,
-	})
-	if err != nil {
-		return err
-	}
-	return fd.Close()
-}
-
-func writeIssue(issue issue, outDir string) error {
-	fd, err := os.Create(filepath.Join(outDir, fmt.Sprintf("issue-%d.html", issue.Number)))
-	if err != nil {
-		return err
-	}
-	err = issueTpl.Execute(fd, issue)
-	if err != nil {
-		return err
-	}
-	return fd.Close()
 }
